@@ -311,8 +311,8 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
             &mut read_client,
             &mut write_client,
             &mut server_stream,
-            server_tx,
             client_tx,
+            server_tx,
         ).await?;
         Ok::<(), io::Error>(())
     }.instrument(info_span!("Sequential proxy"));
