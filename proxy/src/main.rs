@@ -258,7 +258,6 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     -> Result<(), io::Error>
 {
     println!("connecting to server: {}", server_addr);
-    let orign_server_addr = server_addr.clone();
     let timer = SERVER_CONNECT_TIME_SECONDS.with_label_values(&[server_addr]).start_timer();
     let server_addr = lookup_address(server_addr)?;
     let connector = NativeTlsConnector::builder()
@@ -268,9 +267,7 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let tcp_server_stream = TcpStream::connect(&server_addr).await?;
     tcp_server_stream.set_nodelay(true)?;
     
-    println!("{}", orign_server_addr);
-
-    let result = TlsConnector::from(connector).connect(&orign_server_addr, tcp_server_stream).await;
+    let result = TlsConnector::from(connector).connect(&server_addr.to_string(), tcp_server_stream).await;
     let mut server_stream = match result {
         Ok(stream) => stream,
         Err(err) => panic!("{}", err),
