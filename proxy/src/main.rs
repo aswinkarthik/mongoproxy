@@ -262,7 +262,7 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let timer = SERVER_CONNECT_TIME_SECONDS.with_label_values(&[server_addr]).start_timer();
     let server_addr = lookup_address(server_addr)?;
     let connector = NativeTlsConnector::builder()
-                            .use_sni(true)
+                            .danger_accept_invalid_hostnames(true)
                             .min_protocol_version(Some(Protocol::Tlsv12))
                             .build().unwrap();
     let tcp_server_stream = TcpStream::connect(&server_addr).await?;
