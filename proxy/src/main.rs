@@ -12,7 +12,7 @@ use tokio_util::io::StreamReader;
 
 use prometheus::{Counter,CounterVec,HistogramVec,Encoder,TextEncoder};
 use clap::{Arg, App, crate_version};
-use tracing::{info, warn, error, debug, info_span, Instrument, Level};
+use tracing::{info_span, Instrument, Level};
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use lazy_static::lazy_static;
 use tokio_native_tls::{TlsConnector, TlsStream};
@@ -31,7 +31,7 @@ use mongoproxy::appconfig::{AppConfig};
 use mongoproxy::tracker::{MongoStatsTracker};
 
 use mongo_protocol::{MongoMessage};
-
+use log::{info, warn, debug, error, LevelFilter};
 
 type BufBytes = Result<bytes::BytesMut, io::Error>;
 
@@ -133,6 +133,11 @@ async fn main() {
             .help("Skip verification of a TLS host")
             .takes_value(false)
             .required(false))
+        .arg(Arg::with_name("debug")
+            .long("debug")
+            .help("Enable debug logging")
+            .takes_value(false)
+            .required(false))
         .get_matches();
 
     let admin_port = matches.value_of("admin_port").unwrap_or(ADMIN_PORT);
@@ -143,6 +148,10 @@ async fn main() {
     let jaeger_addr = lookup_address(matches.value_of("jaeger_addr").unwrap_or(JAEGER_ADDR)).unwrap();
     let use_tls = matches.occurrences_of("use_tls") > 0;
     let skip_host_verification = matches.occurrences_of("skip_host_verification") > 0;
+    
+    env_logger::builder().filter_level(
+        if matches.occurrences_of("debug") > 0 { LevelFilter::Debug } else { LevelFilter::Info }
+    ).init();
 
     let (writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
     let subscriber = FmtSubscriber::builder()
@@ -155,11 +164,11 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("setting default trace subscriber failed");
 
-    println!("MongoProxy v{}", crate_version!());
+    info!("MongoProxy v{}", crate_version!());
 
     start_admin_listener(&admin_addr)
         .expect("failed to start admin listener");
-    println!("Admin endpoint at http://{}", admin_addr);
+    info!("Admin endpoint at http://{}", admin_addr);
 
     let proxy_spec = matches.value_of("proxy").unwrap();
     let (local_hostport, remote_hostport) = parse_proxy_addresses(proxy_spec).unwrap();
@@ -193,9 +202,9 @@ async fn main() {
 async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig)
 {
     if remote_addr.is_empty() {
-        println!("Proxying {} -> <original dst>", local_addr);
+        info!("Proxying {} -> <original dst>", local_addr);
     } else {
-        println!("Proxying {} -> {}", local_addr, remote_addr);
+        info!("Proxying {} -> {}", local_addr, remote_addr);
     }
 
     let listener = TcpListener::bind(&local_addr).await.unwrap();
@@ -212,10 +221,10 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                         // and thus always have a valid target address. We expect
                         // iptables rules to be in place to block direct access
                         // to the proxy port.
-                        println!("Original destination address: {:?}", sockaddr);
+                        info!("Original destination address: {:?}", sockaddr);
                         sockaddr.to_string()
                     } else {
-                        println!("Host not set and destination address not found: {}", client_addr);
+                        info!("Host not set and destination address not found: {}", client_addr);
                         // TODO: Increase a counter
                         continue;
                     }
@@ -229,16 +238,16 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                 CONNECTION_COUNT_TOTAL.with_label_values(&[&client_addr.to_string()]).inc();
 
                 let conn_handler = async move {
-                    println!("new connection from {}", client_addr);
+                    debug!("new connection from {}", client_addr);
                     match handle_connection(&server_addr, stream, app).await {
                         Ok(_) => {
-                            println!("{} closing connection.", client_addr);
+                            debug!("{} closing connection.", client_addr);
                             DISCONNECTION_COUNT_TOTAL
                                 .with_label_values(&[&client_addr.to_string()])
                                 .inc();
                         },
                         Err(e) => {
-                            println!("{} connection error: {}", client_addr, e);
+                            warn!("{} connection error: {}", client_addr, e);
                             CONNECTION_ERRORS_TOTAL
                                 .with_label_values(&[&client_addr.to_string()])
                                 .inc();
@@ -254,7 +263,7 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                 );
             },
             Err(e) => {
-                println!("accept: {:?}", e)
+                debug!("accept: {:?}", e)
             },
         }
     }
@@ -275,9 +284,9 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let use_tls = app.use_tls;
     let skip_host_verification = app.skip_host_verification;
     if use_tls {
-        println!("connecting to server with TLS: {}", server_addr);
+        debug!("connecting to server with TLS: {}", server_addr);
     } else {
-        println!("connecting to server: {}", server_addr);
+        debug!("connecting to server: {}", server_addr);
     }
 
     let timer = SERVER_CONNECT_TIME_SECONDS.with_label_values(&[server_addr]).start_timer();
@@ -427,7 +436,7 @@ async fn proxy_bytes_tls(
 
             if tracker_ok {
                 if let Err(e) = client_tracker.try_send(Ok(client_buf)) {
-                    println!("error sending to tracker, stop: {}", e);
+                    error!("error sending to tracker, stop: {}", e);
                     TRACKER_CHANNEL_ERRORS_TOTAL.inc();
                     tracker_ok = false;
                 }
@@ -444,7 +453,7 @@ async fn proxy_bytes_tls(
 
             if tracker_ok {
                 if let Err(e) = server_tracker.try_send(Ok(server_buf)) {
-                    println!("error sending to tracker, stop: {}", e);
+                    error!("error sending to tracker, stop: {}", e);
                     TRACKER_CHANNEL_ERRORS_TOTAL.inc();
                     tracker_ok = false;
                 }
@@ -485,7 +494,7 @@ async fn track_mongo_messages(
             Ok((hdr, msg)) => tracker.track_client_request(&hdr, &msg),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => {
-                println!("Client stream processing error: {}", e);
+                error!("Client stream processing error: {}", e);
                 return Err(e);
             }
         }
@@ -500,7 +509,7 @@ async fn track_mongo_messages(
             Ok((hdr, msg)) => tracker.track_server_response(hdr, msg),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => {
-                println!("Server stream processing failed: {}", e);
+                error!("Server stream processing failed: {}", e);
                 return Err(e);
             }
         }
@@ -509,7 +518,7 @@ async fn track_mongo_messages(
 
 fn lookup_address(addr: &str) -> std::io::Result<SocketAddr> {
     if let Some(sockaddr) = addr.to_socket_addrs()?.next() {
-        println!("{} resolves to {}", addr, sockaddr);
+        debug!("{} resolves to {}", addr, sockaddr);
         return Ok(sockaddr);
     }
     Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no usable address found"))

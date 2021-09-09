@@ -17,11 +17,11 @@ pub fn init_tracer(
     jaeger_addr: SocketAddr,
 ) -> (Option<Tracer>, Option<Uninstall>) {
     if !enable_tracer {
-        println!("Tracing not enabled.");
+        info!("Tracing not enabled.");
         return (None, None);
     }
 
-    println!(
+    info!(
         "Initializing tracer with service name {}, agent address: {}",
         service_name, jaeger_addr
     );
@@ -35,7 +35,7 @@ pub fn init_tracer(
         .install()
         .unwrap();
 
-    println!(
+    debug!(
         "Initialized tracer: {:?} provider={:?}",
         tracer,
         tracer.provider()
@@ -57,7 +57,7 @@ pub fn extract_from_text(span_text: &str) -> Option<opentelemetry::Context> {
     }
 
     let trace_data = &span_text[TRACE_ID_PREFIX.len() + 1..];
-    println!("trace-data: {}", trace_data);
+    debug!("trace-data: {}", trace_data);
 
     let mut text_map = HashMap::new();
     text_map.insert(TRACE_ID_PREFIX.to_string(), trace_data.to_string());
