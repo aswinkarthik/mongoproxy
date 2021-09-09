@@ -15,6 +15,8 @@ use clap::{Arg, App, crate_version};
 use tracing::{info, warn, error, debug, info_span, Instrument, Level};
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use lazy_static::lazy_static;
+use tokio_native_tls::{TlsConnector, TlsStream};
+use native_tls::{TlsConnector as NativeTlsConnector, Protocol};
 
 #[macro_use] extern crate prometheus;
 
@@ -141,11 +143,11 @@ async fn main() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("setting default trace subscriber failed");
 
-    info!("MongoProxy v{}", crate_version!());
+    println!("MongoProxy v{}", crate_version!());
 
     start_admin_listener(&admin_addr)
         .expect("failed to start admin listener");
-    info!("Admin endpoint at http://{}", admin_addr);
+    println!("Admin endpoint at http://{}", admin_addr);
 
     let proxy_spec = matches.value_of("proxy").unwrap();
     let (local_hostport, remote_hostport) = parse_proxy_addresses(proxy_spec).unwrap();
@@ -176,9 +178,9 @@ async fn main() {
 async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig)
 {
     if remote_addr.is_empty() {
-        info!("Proxying {} -> <original dst>", local_addr);
+        println!("Proxying {} -> <original dst>", local_addr);
     } else {
-        info!("Proxying {} -> {}", local_addr, remote_addr);
+        println!("Proxying {} -> {}", local_addr, remote_addr);
     }
 
     let listener = TcpListener::bind(&local_addr).await.unwrap();
@@ -195,10 +197,10 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                         // and thus always have a valid target address. We expect
                         // iptables rules to be in place to block direct access
                         // to the proxy port.
-                        debug!("Original destination address: {:?}", sockaddr);
+                        println!("Original destination address: {:?}", sockaddr);
                         sockaddr.to_string()
                     } else {
-                        error!("Host not set and destination address not found: {}", client_addr);
+                        println!("Host not set and destination address not found: {}", client_addr);
                         // TODO: Increase a counter
                         continue;
                     }
@@ -212,16 +214,16 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                 CONNECTION_COUNT_TOTAL.with_label_values(&[&client_addr.to_string()]).inc();
 
                 let conn_handler = async move {
-                    info!("new connection from {}", client_addr);
+                    println!("new connection from {}", client_addr);
                     match handle_connection(&server_addr, stream, app).await {
                         Ok(_) => {
-                            info!("{} closing connection.", client_addr);
+                            println!("{} closing connection.", client_addr);
                             DISCONNECTION_COUNT_TOTAL
                                 .with_label_values(&[&client_addr.to_string()])
                                 .inc();
                         },
                         Err(e) => {
-                            warn!("{} connection error: {}", client_addr, e);
+                            println!("{} connection error: {}", client_addr, e);
                             CONNECTION_ERRORS_TOTAL
                                 .with_label_values(&[&client_addr.to_string()])
                                 .inc();
@@ -237,7 +239,7 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
                 );
             },
             Err(e) => {
-                warn!("accept: {:?}", e)
+                println!("accept: {:?}", e)
             },
         }
     }
@@ -255,10 +257,24 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
 async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: AppConfig)
     -> Result<(), io::Error>
 {
-    info!("connecting to server: {}", server_addr);
+    println!("connecting to server: {}", server_addr);
+    let orign_server_addr = server_addr.clone();
     let timer = SERVER_CONNECT_TIME_SECONDS.with_label_values(&[server_addr]).start_timer();
     let server_addr = lookup_address(server_addr)?;
-    let server_stream = TcpStream::connect(&server_addr).await?;
+    let connector = NativeTlsConnector::builder()
+                            .use_sni(true)
+                            .min_protocol_version(Some(Protocol::Tlsv12))
+                            .build().unwrap();
+    let tcp_server_stream = TcpStream::connect(&server_addr).await?;
+    tcp_server_stream.set_nodelay(true)?;
+    
+    println!("{}", orign_server_addr);
+
+    let result = TlsConnector::from(connector).connect(&orign_server_addr, tcp_server_stream).await;
+    let mut server_stream = match result {
+        Ok(stream) => stream,
+        Err(err) => panic!("{}", err),
+    };
     timer.observe_duration();
 
     let client_addr = format_client_address(&client_stream.peer_addr()?);
@@ -267,7 +283,6 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let tracing_enabled = app.tracer.is_some();
 
     client_stream.set_nodelay(true)?;
-    server_stream.set_nodelay(true)?;
 
     // Start the tracker to parse and track MongoDb messages from the input stream. This works by
     // having the proxy tasks send a copy of the bytes over a channel and process that channel
@@ -276,8 +291,6 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let (client_tx, client_rx): (mpsc::Sender<BufBytes>, mpsc::Receiver<BufBytes>) = mpsc::channel(MAX_CHANNEL_EVENTS);
     let (server_tx, server_rx): (mpsc::Sender<BufBytes>, mpsc::Receiver<BufBytes>) = mpsc::channel(MAX_CHANNEL_EVENTS);
 
-    let signal_client = client_tx.clone();
-    let signal_server = server_tx.clone();
 
     let tracker = MongoStatsTracker::new(
         &client_addr,
@@ -291,22 +304,20 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
         Ok::<(), io::Error>(())
     }.instrument(info_span!("tracker")));
 
-    // Now start proxying bytes between the client and the server.
-
     let (mut read_client, mut write_client) = client_stream.into_split();
-    let (mut read_server, mut write_server) = server_stream.into_split();
 
-    let client_task = async {
-        proxy_bytes(&mut read_client, &mut write_server, client_tx, signal_server).await?;
+    let task = async {
+        proxy_bytes(
+            &mut read_client,
+            &mut write_client,
+            &mut server_stream,
+            server_tx,
+            client_tx,
+        ).await?;
         Ok::<(), io::Error>(())
-    }.instrument(info_span!("client proxy"));
+    }.instrument(info_span!("Sequential proxy"));
 
-    let server_task = async {
-        proxy_bytes(&mut read_server, &mut write_client, server_tx, signal_client).await?;
-        Ok::<(), io::Error>(())
-    }.instrument(info_span!("server proxy"));
-
-    match tokio::try_join!(client_task, server_task) {
+    match tokio::try_join!(task) {
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
         Err(e) => Err(e),
@@ -317,34 +328,47 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
 // for processing. Another channel is used to notify the other tracker of
 // failures.
 async fn proxy_bytes(
-    read_from: &mut OwnedReadHalf,
-    write_to: &mut OwnedWriteHalf,
-    tracker_channel: mpsc::Sender<BufBytes>,
-    notify_channel: mpsc::Sender<BufBytes>,
+    client_read_from: &mut OwnedReadHalf,
+    client_write_to: &mut OwnedWriteHalf,
+    server: &mut TlsStream<TcpStream>,
+    client_tracker: mpsc::Sender<BufBytes>,
+    server_tracker: mpsc::Sender<BufBytes>,
 ) -> Result<(), io::Error>
 {
     let mut tracker_ok = true;
 
     loop {
-        let mut buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
-        let len = read_from.read_buf(&mut buf).await?;
+        let mut client_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
+        let client_len = client_read_from.read_buf(&mut client_buf).await?;
 
-        if len > 0 {
-            write_to.write_all(&buf[0..len]).await?;
+        if client_len > 0 {
+            server.write_all(&client_buf[0..client_len]).await?;
 
             if tracker_ok {
-                if let Err(e) = tracker_channel.try_send(Ok(buf)) {
-                    error!("error sending to tracker, stop: {}", e);
+                if let Err(e) = client_tracker.try_send(Ok(client_buf)) {
+                    println!("error sending to tracker, stop: {}", e);
                     TRACKER_CHANNEL_ERRORS_TOTAL.inc();
                     tracker_ok = false;
-
-                    // Let the other side know that we're closed.
-                    let notification = io::Error::new(io::ErrorKind::UnexpectedEof, "notify channel close");
-                    let _ = notify_channel.send(Err(notification)).await;
                 }
             }
         } else {
-            // EOF on read, return Err to signal try_join! to return
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+        }
+
+        let mut server_buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
+        let server_len = server.read_buf(&mut server_buf).await?;
+
+        if server_len > 0 {
+            client_write_to.write_all(&server_buf[0..server_len]).await?;
+
+            if tracker_ok {
+                if let Err(e) = server_tracker.try_send(Ok(server_buf)) {
+                    println!("error sending to tracker, stop: {}", e);
+                    TRACKER_CHANNEL_ERRORS_TOTAL.inc();
+                    tracker_ok = false;
+                }
+            }
+        } else {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
     }
@@ -380,7 +404,7 @@ async fn track_mongo_messages(
             Ok((hdr, msg)) => tracker.track_client_request(&hdr, &msg),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => {
-                error!("Client stream processing error: {}", e);
+                println!("Client stream processing error: {}", e);
                 return Err(e);
             }
         }
@@ -395,7 +419,7 @@ async fn track_mongo_messages(
             Ok((hdr, msg)) => tracker.track_server_response(hdr, msg),
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
             Err(e) => {
-                error!("Server stream processing failed: {}", e);
+                println!("Server stream processing failed: {}", e);
                 return Err(e);
             }
         }
@@ -404,7 +428,7 @@ async fn track_mongo_messages(
 
 fn lookup_address(addr: &str) -> std::io::Result<SocketAddr> {
     if let Some(sockaddr) = addr.to_socket_addrs()?.next() {
-        debug!("{} resolves to {}", addr, sockaddr);
+        println!("{} resolves to {}", addr, sockaddr);
         return Ok(sockaddr);
     }
     Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "no usable address found"))

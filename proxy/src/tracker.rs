@@ -1,22 +1,30 @@
-use mongo_protocol::{MsgHeader,MongoMessage,MsgOpMsg,ResponseDocuments};
+use crate::appconfig::AppConfig;
 use crate::jaeger_tracing;
-use crate::appconfig::{AppConfig};
+use mongo_protocol::{MongoMessage, MsgHeader, MsgOpMsg, ResponseDocuments};
 
-use std::time::{Instant};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
-use tracing::{debug, warn, info_span};
-use prometheus::{Counter, CounterVec, HistogramVec, Gauge};
+use prometheus::{Counter, CounterVec, Gauge, HistogramVec};
+use tracing::{debug, info_span, warn};
 
-use opentelemetry::trace::{Tracer, SpanKind, TraceContextExt};
-use opentelemetry::trace::Span as _Span;
 use opentelemetry::sdk::trace::Span;
-use opentelemetry::{KeyValue};
+use opentelemetry::trace::Span as _Span;
+use opentelemetry::trace::{SpanKind, TraceContextExt, Tracer};
+use opentelemetry::KeyValue;
 
 use async_bson::Document;
 
 // Common labels for all op metrics
-const OP_LABELS: &[&str] = &["client", "app", "op", "collection", "db", "replicaset", "server"];
+const OP_LABELS: &[&str] = &[
+    "client",
+    "app",
+    "op",
+    "collection",
+    "db",
+    "replicaset",
+    "server",
+];
 
 lazy_static! {
     static ref APP_CONNECTION_COUNT_TOTAL: CounterVec =
@@ -120,8 +128,7 @@ lazy_static! {
 //
 // XXX: If the cursor id's are not unique within a MongoDb instance then there's
 // a risk of collision if there are multiple databases on the same server.
-pub type CursorTraceMapper = HashMap<(std::net::SocketAddr,i64), opentelemetry::Context>;
-
+pub type CursorTraceMapper = HashMap<(std::net::SocketAddr, i64), opentelemetry::Context>;
 
 // Stripped down version of the client request. We need this mostly for timing
 // stats and metric labels.
@@ -163,7 +170,8 @@ impl ClientRequest {
                     if MONGODB_COLLECTION_OPS.contains(opname) {
                         collection_op = Some(opname);
                         coll_name_from_op = Some(s.get_str("op_value").unwrap_or(""));
-                    } if OTHER_MONGODB_OPS.contains(opname) {
+                    }
+                    if OTHER_MONGODB_OPS.contains(opname) {
                         other_op = Some(opname);
                         coll_name_from_param = Some(s.get_str("collection").unwrap_or(""));
                     } else {
@@ -182,8 +190,10 @@ impl ClientRequest {
                         opname.to_owned()
                     } else {
                         let opname = unknown_op.unwrap_or("<no-op>");
-                        warn!("unsupported op: {}", opname);
-                        UNSUPPORTED_OPNAME_COUNTER.with_label_values(&[&opname]).inc();
+                        println!("unsupported op: {}", opname);
+                        UNSUPPORTED_OPNAME_COUNTER
+                            .with_label_values(&[&opname])
+                            .inc();
                         opname.to_owned()
                     }
                 };
@@ -197,14 +207,15 @@ impl ClientRequest {
                 // Once we have the opname, collection and db, see if we can create a tracing span
                 // out of one of the documents.
                 for s in m.documents.iter() {
-                    if let Some((ok_cursor_id, ok_span)) = ClientRequest::maybe_create_span(
-                            &tracker, &m, &db, &coll, &op, s) {
+                    if let Some((ok_cursor_id, ok_span)) =
+                        ClientRequest::maybe_create_span(&tracker, &m, &db, &coll, &op, s)
+                    {
                         cursor_id = ok_cursor_id;
                         span = Some(ok_span);
                         break;
                     }
                 }
-            },
+            }
             MongoMessage::Query(m) => {
                 // Despite the name, QUERY can also be insert, update or delete.
                 // Or a ping, so handle these as well.
@@ -213,7 +224,10 @@ impl ClientRequest {
                 // The database name can be obtained from the message itself, however the collection name
                 // is *not* actually in the full_collection_name, but needs to be obtained from the payload
                 // query. There too are multiple options (op_value or collection)
-                let pos = m.full_collection_name.find('.').unwrap_or_else(|| m.full_collection_name.len());
+                let pos = m
+                    .full_collection_name
+                    .find('.')
+                    .unwrap_or_else(|| m.full_collection_name.len());
                 db = m.full_collection_name[..pos].to_owned();
 
                 if let Some(val) = m.query.get_str("collection") {
@@ -221,7 +235,7 @@ impl ClientRequest {
                 } else if let Some(val) = m.query.get_str("op_value") {
                     coll = val.to_owned();
                 }
-            },
+            }
             MongoMessage::GetMore(m) => {
                 op = String::from("getMore");
                 if let Some(pos) = m.full_collection_name.find('.') {
@@ -229,21 +243,19 @@ impl ClientRequest {
                     db = _db.to_owned();
                     coll = _coll[1..].to_owned();
                 }
-            },
+            }
             // There is no response to OP_INSERT, DELETE, UPDATE so don't bother
             // processing labels for these.
-            MongoMessage::Insert(_) |
-            MongoMessage::Update(_) |
-            MongoMessage::Delete(_) => {
-                warn!("Not processing labels for obsolete INSERT, UPDATE or DELETE messages");
-            },
+            MongoMessage::Insert(_) | MongoMessage::Update(_) | MongoMessage::Delete(_) => {
+                println!("Not processing labels for obsolete INSERT, UPDATE or DELETE messages");
+            }
             MongoMessage::Compressed(_) => {
                 // There's not much we can know about the compressed message unless we
                 // uncompress it. Don't make noise about it.
             }
             other => {
-                warn!("Labels not implemented for {}", other);
-            },
+                println!("Labels not implemented for {}", other);
+            }
         }
 
         ClientRequest {
@@ -269,7 +281,6 @@ impl ClientRequest {
         op: &str,
         doc: &Document,
     ) -> Option<(i64, Span)> {
-
         let tracer = match &tracker.app.tracer {
             Some(t) => t,
             _ => return None,
@@ -287,20 +298,21 @@ impl ClientRequest {
                 let parent_span_ctx = match trace_mapper.get(&(tracker.server_addr_sa, cursor)) {
                     Some(parent_trace_id) => parent_trace_id,
                     _ => {
-                        debug!("Parent span not found for cursor_id={}", cursor);
+                        println!("Parent span not found for cursor_id={}", cursor);
                         return None;
-                    },
+                    }
                 };
 
                 // Because we don't have a cursor id here, we can't store the span in the
                 // trace_mapper just yet. Unfortunately we only get the cursor id in the response
                 // document of the first "find", so that's where we put add it to the trace_mapper.
 
-                let span = tracer.span_builder(op)
+                let span = tracer
+                    .span_builder(op)
                     .with_parent_context(parent_span_ctx.clone())
                     .with_kind(SpanKind::Server)
                     .start(tracer);
-                debug!("Started getMore span: {:?}", span.span_context());
+                println!("Started getMore span: {:?}", span.span_context());
 
                 return Some((cursor, span));
             }
@@ -311,12 +323,12 @@ impl ClientRequest {
             let parent = match jaeger_tracing::extract_from_text(comment) {
                 Some(parent) => parent,
                 _ => {
-                    debug!("No trace id found in $comment");
-                    return None
-                },
+                    println!("No trace id found in $comment");
+                    return None;
+                }
             };
 
-            debug!("Extracted trace header: {:?}", parent);
+            println!("Extracted trace header: {:?}", parent);
             let span = tracer
                 .span_builder(op)
                 .with_parent_context(parent)
@@ -330,7 +342,7 @@ impl ClientRequest {
                     KeyValue::new("db.client.app", tracker.client_application.clone()),
                 ])
                 .start(tracer);
-            debug!("Started initial span: {:?}", span.span_context());
+            println!("Started initial span: {:?}", span.span_context());
 
             // Tag the span with all the documents in the message. This will give
             // us the query payload, delete query, etc.
@@ -339,8 +351,9 @@ impl ClientRequest {
                     // Use the first key in the document as key name
                     if let Some(doc_first_key) = doc.keys().next() {
                         span.set_attribute(KeyValue::new(
-                                format!("db.operation.{}", doc_first_key),
-                                format!("{:.8192}", doc.to_string())));
+                            format!("db.operation.{}", doc_first_key),
+                            format!("{:.8192}", doc.to_string()),
+                        ));
                     }
                 }
             }
@@ -356,14 +369,14 @@ impl ClientRequest {
 }
 
 pub struct MongoStatsTracker {
-    server_addr:            String,
-    server_addr_sa:         std::net::SocketAddr,
-    client_addr:            String,
-    client_application:     String,
-    client_request_hdr:     Option<(ClientRequest, MsgHeader)>,
-    replicaset:             String,
-    server_host:            String,
-    app:                    AppConfig,
+    server_addr: String,
+    server_addr_sa: std::net::SocketAddr,
+    client_addr: String,
+    client_application: String,
+    client_request_hdr: Option<(ClientRequest, MsgHeader)>,
+    replicaset: String,
+    server_host: String,
+    app: AppConfig,
 }
 
 impl Drop for MongoStatsTracker {
@@ -376,11 +389,13 @@ impl Drop for MongoStatsTracker {
     }
 }
 
-impl MongoStatsTracker{
-    pub fn new(client_addr: &str,
-               server_addr: &str,
-               server_addr_sa: std::net::SocketAddr,
-               app: AppConfig) -> Self {
+impl MongoStatsTracker {
+    pub fn new(
+        client_addr: &str,
+        server_addr: &str,
+        server_addr_sa: std::net::SocketAddr,
+        app: AppConfig,
+    ) -> Self {
         MongoStatsTracker {
             client_addr: client_addr.to_string(),
             server_addr: server_addr.to_string(),
@@ -398,7 +413,9 @@ impl MongoStatsTracker{
     }
 
     pub fn track_client_request(&mut self, hdr: &MsgHeader, msg: &MongoMessage) {
-        CLIENT_BYTES_SENT_TOTAL.with_label_values(&[&self.client_addr]).inc_by(hdr.message_length as f64);
+        CLIENT_BYTES_SENT_TOTAL
+            .with_label_values(&[&self.client_addr])
+            .inc_by(hdr.message_length as f64);
 
         let span = info_span!("track_client_request");
         let _ = span.enter();
@@ -433,13 +450,14 @@ impl MongoStatsTracker{
                 let bytes = &msg.section_bytes[0];
                 if let Ok(doc) = bson::Document::from_reader(&mut &bytes[..]) {
                     if let Ok(cursor_ids) = doc.get_array("cursors") {
-                        debug!("Killing cursors: {:?}", cursor_ids);
+                        println!("Killing cursors: {:?}", cursor_ids);
                         for cur_id in cursor_ids.iter() {
                             if let bson::Bson::Int64(cur_id) = cur_id {
                                 let mut trace_mapper = self.app.trace_mapper.lock().unwrap();
 
                                 trace_mapper.remove(&(self.server_addr_sa, *cur_id));
-                                CURSOR_TRACE_PARENT_HASHMAP_CAPACITY.set(trace_mapper.capacity() as f64);
+                                CURSOR_TRACE_PARENT_HASHMAP_CAPACITY
+                                    .set(trace_mapper.capacity() as f64);
                             }
                         }
                     }
@@ -462,7 +480,9 @@ impl MongoStatsTracker{
     }
 
     pub fn track_server_response(&mut self, hdr: MsgHeader, msg: MongoMessage) {
-        CLIENT_BYTES_RECV_TOTAL.with_label_values(&[&self.client_addr]).inc_by(hdr.message_length as f64);
+        CLIENT_BYTES_RECV_TOTAL
+            .with_label_values(&[&self.client_addr])
+            .inc_by(hdr.message_length as f64);
 
         let span = info_span!("track_server_response");
         let _ = span.enter();
@@ -475,14 +495,16 @@ impl MongoStatsTracker{
         if let Some((mut client_request, req_hdr)) = self.client_request_hdr.take() {
             if hdr.response_to != req_hdr.request_id {
                 // And if this starts to happen, then we need to go back to the HashMap of requests ...
-                warn!("Server response to {} does not match client request {}",
-                    hdr.response_to, req_hdr.request_id);
+                println!(
+                    "Server response to {} does not match client request {}",
+                    hdr.response_to, req_hdr.request_id
+                );
                 SERVER_RESPONSE_REQUEST_MISMATCH.inc();
             } else {
                 self.observe_server_response_to(&hdr, &msg, &mut client_request);
             }
         } else {
-            warn!("No client request found for {:?}", hdr);
+            println!("No client request found for {:?}", hdr);
             SERVER_RESPONSE_REQUEST_MISMATCH.inc();
         }
     }
@@ -511,24 +533,28 @@ impl MongoStatsTracker{
         match msg {
             MongoMessage::Msg(m) => {
                 self.process_response_documents(&mut client_request, m.get_documents());
-            },
+            }
             MongoMessage::Reply(r) => {
                 for doc in &r.documents {
                     // The first isMaster response is an OP_REPLY so we need to look at it
                     self.try_parsing_replicaset(doc);
                 }
                 self.process_response_documents(&mut client_request, r.get_documents());
-            },
+            }
             MongoMessage::Compressed(m) => {
-                debug!("Compressed message: {:?}", m);
-            },
+                println!("Compressed message: {:?}", m);
+            }
             other => {
-                warn!("Unrecognized message_type: {:?}", other);
-            },
+                println!("Unrecognized message_type: {:?}", other);
+            }
         }
     }
 
-    fn process_response_documents(&mut self, client_request: &mut ClientRequest, documents: &[Document]) {
+    fn process_response_documents(
+        &mut self,
+        client_request: &mut ClientRequest,
+        documents: &[Document],
+    ) {
         for section in documents {
             self.try_parsing_replicaset(section);
 
@@ -570,7 +596,7 @@ impl MongoStatsTracker{
                 n_docs_changed = Some(section.get_i32("n").unwrap_or(0));
             }
 
-            debug!("client_request: op={} coll={} n_docs_returned={:?} n_docs_changed={:?} n_docs_matched={:?}",
+            println!("client_request: op={} coll={} n_docs_returned={:?} n_docs_changed={:?} n_docs_matched={:?}",
                 client_request.op, client_request.coll, n_docs_returned, n_docs_changed, n_docs_matched);
 
             if let Some(n) = n_docs_returned {
@@ -617,7 +643,7 @@ impl MongoStatsTracker{
                     // Note: To be on the safe side we're always removing, even though not all
                     // getMore's actually have a span
                     if self.is_tracing_enabled() && client_request.cursor_id != 0 {
-                        debug!("Removing parent trace for exhausted cursor server_addr={}, cursor_id={}",
+                        println!("Removing parent trace for exhausted cursor server_addr={}, cursor_id={}",
                             self.server_addr_sa, client_request.cursor_id);
                         let mut trace_mapper = self.app.trace_mapper.lock().unwrap();
 
@@ -642,7 +668,7 @@ impl MongoStatsTracker{
                     // XXX: If the application never does a getMore we will be leaking memory.
                     //
                     if let Some(span) = &client_request.span {
-                        debug!("Saving parent trace for cursor_id={}", cursor_id);
+                        println!("Saving parent trace for cursor_id={}", cursor_id);
                         let mut trace_mapper = self.app.trace_mapper.lock().unwrap();
 
                         let cx = opentelemetry::Context::current_with_span(span.clone());
@@ -651,7 +677,10 @@ impl MongoStatsTracker{
                         CURSOR_TRACE_PARENT_HASHMAP_CAPACITY.set(trace_mapper.capacity() as f64);
                     }
                 } else if client_request.op != "getMore" {
-                    warn!("operation={}, but cursor_id is set: {}", client_request.op, cursor_id);
+                    println!(
+                        "operation={}, but cursor_id is set: {}",
+                        client_request.op, cursor_id
+                    );
                 }
             }
         }
@@ -669,7 +698,6 @@ impl MongoStatsTracker{
             }
         }
     }
-
 }
 
 /// Extract `appname` from MongoDb `isMaster` query

@@ -1,22 +1,24 @@
-use std::net::{SocketAddr};
+use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;
 
 // Kudos to the folks at Linkerd for this.
 #[cfg(target_os = "linux")]
 pub fn orig_dst_addr<R>(sock: &R) -> Option<SocketAddr>
-    where R: AsRawFd
+where
+    R: AsRawFd,
 {
-	let fd = sock.as_raw_fd();
-	let r = unsafe { linux::so_original_dst(fd) };
-	r.ok()
+    let fd = sock.as_raw_fd();
+    let r = unsafe { linux::so_original_dst(fd) };
+    r.ok()
 }
 
 #[cfg(not(target_os = "linux"))]
 //pub fn orig_dst_addr(_sock: impl AsRawFd) -> Option<SocketAddr> {
 pub fn orig_dst_addr<R>(_sock: &R) -> Option<SocketAddr>
-    where R: AsRawFd
+where
+    R: AsRawFd,
 {
-	None
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -40,7 +42,7 @@ mod linux {
         );
         if ret != 0 {
             let e = io::Error::last_os_error();
-            warn!("failed to read SO_ORIGINAL_DST: {:?}", e);
+            println!("failed to read SO_ORIGINAL_DST: {:?}", e);
             return Err(e);
         }
 

@@ -1,25 +1,25 @@
-use std::fmt;
-use tracing::{error, warn, info, debug};
+use async_bson::{read_cstring, Document, DocumentParser, DocumentReader};
 use byteorder::{LittleEndian, WriteBytesExt};
-use async_bson::{DocumentParser, DocumentReader, Document, read_cstring};
 use lazy_static::lazy_static;
+use std::fmt;
+use tracing::{debug, error, info, warn};
 
-#[cfg(feature="is_sync")]
+#[cfg(feature = "is_sync")]
 use {
-    std::io::{self, Cursor},
     byteorder::ReadBytesExt,
+    std::io::{self, Cursor},
 };
 
-#[cfg(not(feature="is_sync"))]
+#[cfg(not(feature = "is_sync"))]
 use tokio::io::{self, AsyncReadExt};
 
-use std::io::{Result, Write, Error, ErrorKind};
+use std::io::{Error, ErrorKind, Result, Write};
 
-#[macro_use] extern crate prometheus;
-use prometheus::{CounterVec};
+#[macro_use]
+extern crate prometheus;
+use prometheus::CounterVec;
 
 pub const HEADER_LENGTH: usize = 16;
-
 
 lazy_static! {
     static ref MONGO_DOC_PARSER: DocumentParser<'static> =
@@ -72,7 +72,7 @@ lazy_static! {
 }
 
 #[derive(Debug)]
-pub enum OpCode{
+pub enum OpCode {
     OpReply = 1,
     OpUpdate = 2001,
     OpInsert = 2002,
@@ -115,7 +115,6 @@ impl fmt::Display for MongoMessage {
 }
 
 impl MongoMessage {
-
     #[maybe_async::maybe_async]
     pub async fn from_reader(
         mut rdr: impl DocumentReader,
@@ -128,31 +127,38 @@ impl MongoMessage {
             return Err(Error::new(ErrorKind::Other, "Invalid MongoDb header"));
         }
 
-        debug!("have header: {}", hdr);
+        println!("have header: {}", hdr);
 
         // Take only as much as promised in the header.
         let message_length = (hdr.message_length - HEADER_LENGTH) as u64;
         let mut rdr = rdr.take(message_length);
 
-        OPCODE_COUNTER.with_label_values(&[&hdr.op_code.to_string()]).inc();
+        OPCODE_COUNTER
+            .with_label_values(&[&hdr.op_code.to_string()])
+            .inc();
 
         let msg = match MongoMessage::extract_message(
-                hdr.op_code,
-                &mut rdr,
-                log_mongo_messages,
-                collect_tracing_data,
-                message_length).await {
+            hdr.op_code,
+            &mut rdr,
+            log_mongo_messages,
+            collect_tracing_data,
+            message_length,
+        )
+        .await
+        {
             Ok(msg) => msg,
             Err(e) => {
-                error!("Failed to parse MongoDb {} message: {}", hdr.op_code, e);
-                MESSAGE_PARSE_ERRORS_COUNTER.with_label_values(&[&e.to_string()]).inc();
+                println!("Failed to parse MongoDb {} message: {}", hdr.op_code, e);
+                MESSAGE_PARSE_ERRORS_COUNTER
+                    .with_label_values(&[&e.to_string()])
+                    .inc();
                 return Err(e);
             }
         };
 
         let len = io::copy(&mut rdr, &mut io::sink()).await?;
         if len > 0 {
-            warn!("partial message, sinking {} bytes.", len);
+            println!("partial message, sinking {} bytes.", len);
         }
 
         Ok((hdr, msg))
@@ -170,46 +176,53 @@ impl MongoMessage {
         message_length: u64,
     ) -> Result<MongoMessage> {
         let msg = match op {
-               1 => MongoMessage::Reply(MsgOpReply::from_reader(&mut rdr, log_mongo_messages).await?),
-            2004 => MongoMessage::Query(MsgOpQuery::from_reader(&mut rdr, log_mongo_messages).await?),
+            1 => MongoMessage::Reply(MsgOpReply::from_reader(&mut rdr, log_mongo_messages).await?),
+            2004 => {
+                MongoMessage::Query(MsgOpQuery::from_reader(&mut rdr, log_mongo_messages).await?)
+            }
             2005 => MongoMessage::GetMore(MsgOpGetMore::from_reader(&mut rdr).await?),
             2001 => MongoMessage::Update(MsgOpUpdate::from_reader(&mut rdr).await?),
             2006 => MongoMessage::Delete(MsgOpDelete::from_reader(&mut rdr).await?),
             2002 => MongoMessage::Insert(MsgOpInsert::from_reader(&mut rdr).await?),
             2012 => MongoMessage::Compressed(MsgOpCompressed::from_reader(&mut rdr).await?),
-            2013 => MongoMessage::Msg(MsgOpMsg::from_reader(
-                        &mut rdr,
-                        log_mongo_messages,
-                        collect_tracing_data,
-                        message_length,
-                    ).await?),
+            2013 => MongoMessage::Msg(
+                MsgOpMsg::from_reader(
+                    &mut rdr,
+                    log_mongo_messages,
+                    collect_tracing_data,
+                    message_length,
+                )
+                .await?,
+            ),
             2010 | 2011 => {
                 // This is an undocumented legacy protocol that some clients (bad Robo3T)
                 // still use. We ignore it.
                 MongoMessage::None
-            },
+            }
             _ => {
-                UNSUPPORTED_OPCODE_COUNTER.with_label_values(&[&op.to_string()]).inc();
-                warn!("Unhandled OP: {}", op);
+                UNSUPPORTED_OPCODE_COUNTER
+                    .with_label_values(&[&op.to_string()])
+                    .inc();
+                println!("Unhandled OP: {}", op);
                 MongoMessage::None
-            },
+            }
         };
 
         Ok(msg)
     }
 }
 
-#[derive(Debug,Clone,Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MsgHeader {
     pub message_length: usize,
-    pub request_id:     u32,
-    pub response_to:    u32,
-    pub op_code:        u32,
+    pub request_id: u32,
+    pub response_to: u32,
+    pub op_code: u32,
 }
 
 impl MsgHeader {
     pub fn new() -> MsgHeader {
-        MsgHeader{
+        MsgHeader {
             message_length: 0,
             request_id: 0,
             response_to: 0,
@@ -219,11 +232,16 @@ impl MsgHeader {
 
     #[maybe_async::maybe_async]
     pub async fn from_reader(mut rdr: impl DocumentReader) -> Result<Self> {
-        let message_length  = rdr.read_u32_le().await? as usize;
-        let request_id      = rdr.read_u32_le().await?;
-        let response_to     = rdr.read_u32_le().await?;
-        let op_code         = rdr.read_u32_le().await?;
-        Ok(MsgHeader{message_length, request_id, response_to, op_code})
+        let message_length = rdr.read_u32_le().await? as usize;
+        let request_id = rdr.read_u32_le().await?;
+        let response_to = rdr.read_u32_le().await?;
+        let op_code = rdr.read_u32_le().await?;
+        Ok(MsgHeader {
+            message_length,
+            request_id,
+            response_to,
+            op_code,
+        })
     }
 
     pub fn write(&self, mut writer: impl Write) -> Result<()> {
@@ -237,8 +255,11 @@ impl MsgHeader {
 
 impl fmt::Display for MsgHeader {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "op: {}, request_id: {}, response_to: {}, length: {}",
-        self.op_code, self.request_id, self.response_to, self.message_length)
+        write!(
+            f,
+            "op: {}, request_id: {}, response_to: {}, length: {}",
+            self.op_code, self.request_id, self.response_to, self.message_length
+        )
     }
 }
 
@@ -249,15 +270,15 @@ pub trait ResponseDocuments {
 
 #[derive(Debug)]
 pub struct MsgOpMsg {
-    pub flag_bits:          u32,
-    pub documents:          Vec<Document>,
-    pub section_bytes:      Vec<Vec<u8>>,
+    pub flag_bits: u32,
+    pub documents: Vec<Document>,
+    pub section_bytes: Vec<Vec<u8>>,
 }
 
 impl fmt::Display for MsgOpMsg {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         writeln!(f, "OP_MSG flags: {}", self.flag_bits)?;
-        for (i, v)  in self.documents.iter().enumerate() {
+        for (i, v) in self.documents.iter().enumerate() {
             writeln!(f, "section {}: {}", i, v)?;
         }
         Ok(())
@@ -271,7 +292,6 @@ impl ResponseDocuments for MsgOpMsg {
 }
 
 impl MsgOpMsg {
-
     // Construct a new OP_MSG message from a reader. This requires the length of the whole
     // message to be passed in to simplify handling of the optional checksum.
     #[maybe_async::maybe_async]
@@ -280,29 +300,40 @@ impl MsgOpMsg {
         log_mongo_messages: bool,
         collect_tracing_data: bool,
         message_length: u64,
-    ) -> Result<Self>
-    {
+    ) -> Result<Self> {
         let flag_bits = rdr.read_u32_le().await?;
-        debug!("flag_bits={:04x}", flag_bits);
+        println!("flag_bits={:04x}", flag_bits);
 
         let body_length = if flag_bits & 1 == 1 {
-            message_length - 4 - 4      // Subtract flags and checksum bytes
+            message_length - 4 - 4 // Subtract flags and checksum bytes
         } else {
-            message_length - 4          // Subtract just the flags
+            message_length - 4 // Subtract just the flags
         };
 
-        #[cfg(not(feature="is_sync"))]
+        #[cfg(not(feature = "is_sync"))]
         let msg = {
             let mut rdr = rdr.take(body_length);
 
-            MsgOpMsg::read_body(&mut rdr, flag_bits, log_mongo_messages, collect_tracing_data).await?
+            MsgOpMsg::read_body(
+                &mut rdr,
+                flag_bits,
+                log_mongo_messages,
+                collect_tracing_data,
+            )
+            .await?
         };
-        #[cfg(feature="is_sync")]
+        #[cfg(feature = "is_sync")]
         let msg = {
             let mut buf = vec![0u8; body_length as usize];
             rdr.read_exact(&mut buf[..]).await?;
 
-            MsgOpMsg::read_body(&mut &buf[..], flag_bits, log_mongo_messages, collect_tracing_data).await?
+            MsgOpMsg::read_body(
+                &mut &buf[..],
+                flag_bits,
+                log_mongo_messages,
+                collect_tracing_data,
+            )
+            .await?
         };
 
         if flag_bits & 1 == 1 {
@@ -332,32 +363,34 @@ impl MsgOpMsg {
         flag_bits: u32,
         log_mongo_messages: bool,
         collect_tracing_data: bool,
-    ) -> Result<Self>
-    {
+    ) -> Result<Self> {
         let mut documents = Vec::new();
         let mut section_bytes = Vec::new();
         let mut rdr = &mut rdr;
 
         loop {
             let kind = match rdr.read_u8().await {
-                Ok(r)   => r,
+                Ok(r) => r,
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
                     // This is OK if we've already read at least one doc. In fact
                     // we're relying on reaching an EOF here to determine when to
                     // stop parsing.
                     if documents.is_empty() {
-                        return Err(Error::new(ErrorKind::Other, "EOF reached, but no sections were read"));
+                        return Err(Error::new(
+                            ErrorKind::Other,
+                            "EOF reached, but no sections were read",
+                        ));
                     }
                     break;
-                },
-                Err(e)  => {
-                    warn!("error on read: {}", e);
+                }
+                Err(e) => {
+                    println!("error on read: {}", e);
                     return Err(e);
-                },
+                }
             };
 
             if kind == 0 {
-                debug!("kind=0");
+                println!("kind=0");
 
                 MsgOpMsg::process_section_document(
                     &mut rdr,
@@ -365,11 +398,12 @@ impl MsgOpMsg {
                     collect_tracing_data,
                     &mut documents,
                     &mut section_bytes,
-                    ).await?;
+                )
+                .await?;
             } else if kind == 1 {
                 let section_size = rdr.read_u32_le().await? as usize;
                 let seq_id = read_cstring(&mut rdr).await?;
-                debug!("kind=1: section_size={}, seq_id={}", section_size, seq_id);
+                println!("kind=1: section_size={}, seq_id={}", section_size, seq_id);
 
                 // Section size includes the size of the seq_id cstring and the length bytes, but
                 // does not include the "kind" byte. We take this length of bytes and assume that
@@ -377,7 +411,7 @@ impl MsgOpMsg {
                 let section_size = section_size - seq_id.len() - 1 - 4;
 
                 // Consume all the documents in the section, but no more.
-                #[cfg(not(feature="is_sync"))]
+                #[cfg(not(feature = "is_sync"))]
                 {
                     let mut section_rdr = rdr.take(section_size as u64);
                     while MsgOpMsg::process_section_document(
@@ -385,11 +419,13 @@ impl MsgOpMsg {
                         log_mongo_messages,
                         collect_tracing_data,
                         &mut documents,
-                        &mut section_bytes
-                    ).await?  {}
+                        &mut section_bytes,
+                    )
+                    .await?
+                    {}
                 }
 
-                #[cfg(feature="is_sync")]
+                #[cfg(feature = "is_sync")]
                 {
                     let mut buf = vec![0u8; section_size];
                     rdr.read_exact(&mut buf[..]).await?;
@@ -401,16 +437,22 @@ impl MsgOpMsg {
                         log_mongo_messages,
                         collect_tracing_data,
                         &mut documents,
-                        &mut section_bytes
-                    ).await?  {}
+                        &mut section_bytes,
+                    )
+                    .await?
+                    {}
                 }
             } else {
-                warn!("unrecognized kind={}", kind);
+                println!("unrecognized kind={}", kind);
                 break;
             }
         }
 
-        Ok(MsgOpMsg{flag_bits, documents, section_bytes})
+        Ok(MsgOpMsg {
+            flag_bits,
+            documents,
+            section_bytes,
+        })
     }
 
     #[maybe_async::maybe_async]
@@ -419,22 +461,21 @@ impl MsgOpMsg {
         log_mongo_messages: bool,
         collect_tracing_data: bool,
         documents: &mut Vec<Document>,
-        section_bytes: &mut Vec<Vec<u8>>
-    ) -> Result<bool>
-    {
-        let doc = MONGO_DOC_PARSER.parse_document_keep_bytes(
-                &mut rdr,
-                log_mongo_messages | collect_tracing_data).await;
+        section_bytes: &mut Vec<Vec<u8>>,
+    ) -> Result<bool> {
+        let doc = MONGO_DOC_PARSER
+            .parse_document_keep_bytes(&mut rdr, log_mongo_messages | collect_tracing_data)
+            .await;
         match doc {
             Ok(doc) => {
-                debug!("doc: {}", doc);
+                println!("doc: {}", doc);
 
                 if log_mongo_messages {
                     if let Some(bytes) = doc.get_raw_bytes() {
                         if let Ok(doc) = bson::Document::from_reader(&mut &bytes[..]) {
-                            info!("OP_MSG BSON: {}", doc);
+                            println!("OP_MSG BSON: {}", doc);
                         } else {
-                            warn!("OP_MSG BSON parsing failed");
+                            println!("OP_MSG BSON parsing failed");
                         }
                     }
                 }
@@ -447,14 +488,12 @@ impl MsgOpMsg {
 
                 documents.push(doc);
                 Ok(true)
-            },
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                Ok(false)
-            },
-            Err(e)  => {
-                warn!("error on read: {}", e);
+            }
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => {
+                println!("error on read: {}", e);
                 Err(e)
-            },
+            }
         }
     }
 
@@ -467,10 +506,10 @@ impl MsgOpMsg {
         let seq_id = "documents";
         let seq_len = 1 + seq_id.len() + doc_buf.len() + 4;
 
-        writer.write_u8(1)?;    // "kind" byte
+        writer.write_u8(1)?; // "kind" byte
         writer.write_u32::<LittleEndian>(seq_len as u32)?;
         writer.write_all(seq_id.as_bytes())?;
-        writer.write_u8(0)?;    // terminator for the cstring
+        writer.write_u8(0)?; // terminator for the cstring
         writer.write_all(&doc_buf[..])?;
 
         Ok(())
@@ -479,7 +518,7 @@ impl MsgOpMsg {
 
 #[derive(Debug)]
 pub struct MsgOpQuery {
-    flags:  u32,
+    flags: u32,
     pub full_collection_name: String,
     number_to_skip: i32,
     number_to_return: i32,
@@ -489,33 +528,46 @@ pub struct MsgOpQuery {
 
 impl fmt::Display for MsgOpQuery {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "OP_QUERY flags: {}, collection: {}, to_skip: {}, to_return: {}",
-               self.flags, self.full_collection_name, self.number_to_skip, self.number_to_return)?;
+        writeln!(
+            f,
+            "OP_QUERY flags: {}, collection: {}, to_skip: {}, to_return: {}",
+            self.flags, self.full_collection_name, self.number_to_skip, self.number_to_return
+        )?;
         writeln!(f, "query: {}", self.query)
     }
 }
 
 impl MsgOpQuery {
-
     #[maybe_async::maybe_async]
-    pub async fn from_reader(mut rdr: impl DocumentReader, log_mongo_messages: bool) -> Result<Self> {
-        let flags  = rdr.read_u32_le().await?;
+    pub async fn from_reader(
+        mut rdr: impl DocumentReader,
+        log_mongo_messages: bool,
+    ) -> Result<Self> {
+        let flags = rdr.read_u32_le().await?;
         let full_collection_name = read_cstring(&mut rdr).await?;
         let number_to_skip = rdr.read_i32_le().await?;
         let number_to_return = rdr.read_i32_le().await?;
-        let query = MONGO_DOC_PARSER.parse_document_keep_bytes(&mut rdr, log_mongo_messages).await?;
+        let query = MONGO_DOC_PARSER
+            .parse_document_keep_bytes(&mut rdr, log_mongo_messages)
+            .await?;
 
         if log_mongo_messages {
             if let Some(bytes) = query.get_raw_bytes() {
                 if let Ok(doc) = bson::Document::from_reader(&mut &bytes[..]) {
-                    info!("OP_QUERY BSON: {}", doc);
+                    println!("OP_QUERY BSON: {}", doc);
                 }
             } else {
-                warn!("OP_QUERY BSON parsing failed");
+                println!("OP_QUERY BSON parsing failed");
             }
         }
 
-        Ok(MsgOpQuery{flags, full_collection_name, number_to_skip, number_to_return, query})
+        Ok(MsgOpQuery {
+            flags,
+            full_collection_name,
+            number_to_skip,
+            number_to_return,
+            query,
+        })
     }
 }
 
@@ -528,13 +580,15 @@ pub struct MsgOpGetMore {
 
 impl fmt::Display for MsgOpGetMore {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "OP_GET_MORE collection: {}, to_return: {}, cursor_id: {}",
-               self.full_collection_name, self.number_to_return, self.cursor_id)
+        writeln!(
+            f,
+            "OP_GET_MORE collection: {}, to_return: {}, cursor_id: {}",
+            self.full_collection_name, self.number_to_return, self.cursor_id
+        )
     }
 }
 
 impl MsgOpGetMore {
-
     #[maybe_async::maybe_async]
     pub async fn from_reader(mut rdr: impl DocumentReader) -> Result<Self> {
         let _zero = rdr.read_i32_le().await?;
@@ -542,7 +596,11 @@ impl MsgOpGetMore {
         let number_to_return = rdr.read_i32_le().await?;
         let cursor_id = rdr.read_i64_le().await?;
 
-        Ok(MsgOpGetMore{full_collection_name, number_to_return, cursor_id})
+        Ok(MsgOpGetMore {
+            full_collection_name,
+            number_to_return,
+            cursor_id,
+        })
     }
 }
 
@@ -556,13 +614,15 @@ pub struct MsgOpUpdate {
 
 impl fmt::Display for MsgOpUpdate {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "OP_UPDATE flags: {}, collection: {}",
-               self.flags, self.full_collection_name)
+        write!(
+            f,
+            "OP_UPDATE flags: {}, collection: {}",
+            self.flags, self.full_collection_name
+        )
     }
 }
 
 impl MsgOpUpdate {
-
     #[maybe_async::maybe_async]
     pub async fn from_reader(mut rdr: impl DocumentReader) -> Result<Self> {
         let _zero = rdr.read_u32_le().await?;
@@ -571,7 +631,12 @@ impl MsgOpUpdate {
         let selector = MONGO_DOC_PARSER.parse_document(&mut rdr).await?;
         let update = MONGO_DOC_PARSER.parse_document(&mut rdr).await?;
 
-        Ok(MsgOpUpdate{flags, full_collection_name, selector, update})
+        Ok(MsgOpUpdate {
+            flags,
+            full_collection_name,
+            selector,
+            update,
+        })
     }
 }
 
@@ -584,13 +649,15 @@ pub struct MsgOpDelete {
 
 impl fmt::Display for MsgOpDelete {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "OP_DELETE flags: {}, collection: {}",
-               self.flags, self.full_collection_name)
+        write!(
+            f,
+            "OP_DELETE flags: {}, collection: {}",
+            self.flags, self.full_collection_name
+        )
     }
 }
 
 impl MsgOpDelete {
-
     #[maybe_async::maybe_async]
     pub async fn from_reader(mut rdr: impl DocumentReader) -> Result<Self> {
         let _zero = rdr.read_u32_le().await?;
@@ -598,7 +665,11 @@ impl MsgOpDelete {
         let flags = rdr.read_u32_le().await?;
         let selector = MONGO_DOC_PARSER.parse_document(&mut rdr).await?;
 
-        Ok(MsgOpDelete{flags, full_collection_name, selector})
+        Ok(MsgOpDelete {
+            flags,
+            full_collection_name,
+            selector,
+        })
     }
 }
 
@@ -610,8 +681,11 @@ pub struct MsgOpInsert {
 
 impl fmt::Display for MsgOpInsert {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "OP_INSERT flags: {}, collection: {}",
-               self.flags, self.full_collection_name)
+        write!(
+            f,
+            "OP_INSERT flags: {}, collection: {}",
+            self.flags, self.full_collection_name
+        )
     }
 }
 
@@ -623,24 +697,30 @@ impl MsgOpInsert {
 
         // There's also a list of documents in the message, but we ignore it.
 
-        Ok(MsgOpInsert{flags, full_collection_name})
+        Ok(MsgOpInsert {
+            flags,
+            full_collection_name,
+        })
     }
 }
 
 #[derive(Debug)]
 pub struct MsgOpReply {
-    flags:                  u32,
-    cursor_id:              u64,
-    starting_from:          u32,
-    pub number_returned:    u32,
-    pub documents:          Vec<Document>,
+    flags: u32,
+    cursor_id: u64,
+    starting_from: u32,
+    pub number_returned: u32,
+    pub documents: Vec<Document>,
 }
 
 impl fmt::Display for MsgOpReply {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        writeln!(f, "OP_REPLY flags: {}, cursor_id: {}, starting_from: {}, number_returned: {}",
-               self.flags, self.cursor_id, self.starting_from, self.number_returned)?;
-        for (i, v)  in self.documents.iter().enumerate() {
+        writeln!(
+            f,
+            "OP_REPLY flags: {}, cursor_id: {}, starting_from: {}, number_returned: {}",
+            self.flags, self.cursor_id, self.starting_from, self.number_returned
+        )?;
+        for (i, v) in self.documents.iter().enumerate() {
             writeln!(f, "document {}: {}", i, v)?;
         }
         Ok(())
@@ -654,16 +734,21 @@ impl ResponseDocuments for MsgOpReply {
 }
 
 impl MsgOpReply {
-
     #[maybe_async::maybe_async]
-    pub async fn from_reader(mut rdr: impl DocumentReader, log_mongo_messages: bool) -> Result<Self> {
-        let flags  = rdr.read_u32_le().await?;
+    pub async fn from_reader(
+        mut rdr: impl DocumentReader,
+        log_mongo_messages: bool,
+    ) -> Result<Self> {
+        let flags = rdr.read_u32_le().await?;
         let cursor_id = rdr.read_u64_le().await?;
         let starting_from = rdr.read_u32_le().await?;
         let number_returned = rdr.read_u32_le().await?;
         let mut documents = Vec::new();
 
-        while let Ok(doc) = MONGO_DOC_PARSER.parse_document_keep_bytes(&mut rdr, log_mongo_messages).await {
+        while let Ok(doc) = MONGO_DOC_PARSER
+            .parse_document_keep_bytes(&mut rdr, log_mongo_messages)
+            .await
+        {
             documents.push(doc);
         }
 
@@ -671,15 +756,21 @@ impl MsgOpReply {
             for doc in documents.iter() {
                 if let Some(bytes) = doc.get_raw_bytes() {
                     if let Ok(doc) = bson::Document::from_reader(&mut &bytes[..]) {
-                        info!("OP_REPLY BSON: {}", doc);
+                        println!("OP_REPLY BSON: {}", doc);
                     }
                 } else {
-                    warn!("OP_REPLY BSON parsing failed");
+                    println!("OP_REPLY BSON parsing failed");
                 }
             }
         }
 
-        Ok(MsgOpReply{flags, cursor_id, starting_from, number_returned, documents})
+        Ok(MsgOpReply {
+            flags,
+            cursor_id,
+            starting_from,
+            number_returned,
+            documents,
+        })
     }
 }
 
@@ -692,13 +783,15 @@ pub struct MsgOpCompressed {
 
 impl fmt::Display for MsgOpCompressed {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "OP_COMPRESSED op: {}, uncompressed_size: {}, compressor: {}",
-               self.original_op, self.uncompressed_size, self.compressor_id)
+        write!(
+            f,
+            "OP_COMPRESSED op: {}, uncompressed_size: {}, compressor: {}",
+            self.original_op, self.uncompressed_size, self.compressor_id
+        )
     }
 }
 
 impl MsgOpCompressed {
-
     #[maybe_async::maybe_async]
     pub async fn from_reader(mut rdr: impl DocumentReader) -> Result<Self> {
         let original_op = rdr.read_i32_le().await?;
@@ -708,7 +801,11 @@ impl MsgOpCompressed {
         // Ignore the actual compressed message, we are not going to use it
         let _len = io::copy(&mut rdr, &mut io::sink()).await?;
 
-        Ok(MsgOpCompressed{original_op, uncompressed_size, compressor_id})
+        Ok(MsgOpCompressed {
+            original_op,
+            uncompressed_size,
+            compressor_id,
+        })
     }
 }
 
@@ -724,7 +821,11 @@ pub fn debug_fmt(buf: &[u8]) -> String {
         txt_str.push(if *b < 32 || *b > 127 { '.' } else { *b as char });
 
         if (i + 1) % 16 == 0 {
-            fmt::write(&mut result, format_args!("{:08x}: {}{}\n", offset, hex_str, txt_str)).unwrap();
+            fmt::write(
+                &mut result,
+                format_args!("{:08x}: {}{}\n", offset, hex_str, txt_str),
+            )
+            .unwrap();
             hex_str.clear();
             txt_str.clear();
             offset += 16;
@@ -733,7 +834,11 @@ pub fn debug_fmt(buf: &[u8]) -> String {
 
     if !hex_str.is_empty() {
         let padding = " ".repeat(48 - hex_str.len());
-        fmt::write(&mut result, format_args!("{:08x}: {}{}{}\n", offset, hex_str, padding, txt_str)).unwrap();
+        fmt::write(
+            &mut result,
+            format_args!("{:08x}: {}{}{}\n", offset, hex_str, padding, txt_str),
+        )
+        .unwrap();
     }
 
     result
@@ -743,10 +848,10 @@ pub fn debug_fmt(buf: &[u8]) -> String {
 
 mod tests {
     use super::*;
-    use byteorder::{LittleEndian, WriteBytesExt};
     use bson::doc;
+    use byteorder::{LittleEndian, WriteBytesExt};
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_header() {
         let hdr = MsgHeader {
             message_length: 100,
@@ -766,7 +871,7 @@ mod tests {
     }
 
     fn msgop_to_buf(doc_id: u32, mut buf: impl Write) {
-        buf.write_i32::<LittleEndian>(0i32).unwrap();   // flag bits
+        buf.write_i32::<LittleEndian>(0i32).unwrap(); // flag bits
 
         // Section 0
         buf.write_u8(0).unwrap();
@@ -774,40 +879,45 @@ mod tests {
         doc.to_writer(&mut buf).unwrap();
 
         // Section 1 - first document
-        buf.write_u8(1).unwrap();                                           // section type=1
+        buf.write_u8(1).unwrap(); // section type=1
         let mut doc_buf = Vec::new();
-        let doc = doc! { format!("y{}", doc_id): "bar" };                   // first document
-        doc.to_writer(&mut doc_buf).unwrap();                               // tmp write to get length
-        buf.write_i32::<LittleEndian>(4 + 4 + doc_buf.len() as i32).unwrap();
-        buf.write(b"id0\0").unwrap();                                       // section id
+        let doc = doc! { format!("y{}", doc_id): "bar" }; // first document
+        doc.to_writer(&mut doc_buf).unwrap(); // tmp write to get length
+        buf.write_i32::<LittleEndian>(4 + 4 + doc_buf.len() as i32)
+            .unwrap();
+        buf.write(b"id0\0").unwrap(); // section id
         doc.to_writer(&mut buf).unwrap();
 
         // Section 2 - back to back documents
-        buf.write_u8(1).unwrap();                                           // section type=1
+        buf.write_u8(1).unwrap(); // section type=1
         let mut doc_buf = Vec::new();
-        let doc = doc! { format!("z{}", doc_id): "baz" };                   // first document
-        doc.to_writer(&mut doc_buf).unwrap();                               // tmp write to get length
-        buf.write_i32::<LittleEndian>(4 + 4 + 2*doc_buf.len() as i32).unwrap();
-        buf.write(b"id1\0").unwrap();                                       // section id
-        doc.to_writer(&mut buf).unwrap();                                   // first doc
-        doc.to_writer(&mut buf).unwrap();                                   // second doc
+        let doc = doc! { format!("z{}", doc_id): "baz" }; // first document
+        doc.to_writer(&mut doc_buf).unwrap(); // tmp write to get length
+        buf.write_i32::<LittleEndian>(4 + 4 + 2 * doc_buf.len() as i32)
+            .unwrap();
+        buf.write(b"id1\0").unwrap(); // section id
+        doc.to_writer(&mut buf).unwrap(); // first doc
+        doc.to_writer(&mut buf).unwrap(); // second doc
 
         // Section 3 - one more to check that we're reading it all
-        buf.write_u8(1).unwrap();                                           // section type=1
+        buf.write_u8(1).unwrap(); // section type=1
         let mut doc_buf = Vec::new();
-        let doc = doc! { format!("b{}", doc_id): "brr" };                   // first document
-        doc.to_writer(&mut doc_buf).unwrap();                               // tmp write to get length
-        buf.write_i32::<LittleEndian>(4 + 4 + doc_buf.len() as i32).unwrap();
-        buf.write(b"id2\0").unwrap();                                       // section id
+        let doc = doc! { format!("b{}", doc_id): "brr" }; // first document
+        doc.to_writer(&mut doc_buf).unwrap(); // tmp write to get length
+        buf.write_i32::<LittleEndian>(4 + 4 + doc_buf.len() as i32)
+            .unwrap();
+        buf.write(b"id2\0").unwrap(); // section id
         doc.to_writer(&mut buf).unwrap();
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_msg() {
         let mut buf = Vec::new();
         msgop_to_buf(0, &mut buf);
 
-        let msg = MsgOpMsg::from_reader(&mut &buf[..], false, false, buf.len() as u64).await.unwrap();
+        let msg = MsgOpMsg::from_reader(&mut &buf[..], false, false, buf.len() as u64)
+            .await
+            .unwrap();
 
         assert_eq!(0, msg.flag_bits);
         assert_eq!(5, msg.documents.len());
@@ -819,30 +929,34 @@ mod tests {
         assert_eq!("b0", msg.documents[4].get_str("op").unwrap());
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_msg_raw() {
         // This is an OP_MSG that contains a "delete" operation with payloads of type 0 and 1
         // (total of 2 BSON documents).
         let buf = vec![
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x02, 0x64, 0x65, 0x6c, 0x65, 0x74, 0x65,
-            0x00, 0x08, 0x00, 0x00, 0x00, 0x6b, 0x69, 0x74, 0x74, 0x65, 0x6e, 0x73, 0x00, 0x08, 0x6f, 0x72,
-            0x64, 0x65, 0x72, 0x65, 0x64, 0x00, 0x01, 0x03, 0x6c, 0x73, 0x69, 0x64, 0x00, 0x1e, 0x00, 0x00,
-            0x00, 0x05, 0x69, 0x64, 0x00, 0x10, 0x00, 0x00, 0x00, 0x04, 0x9a, 0xe6, 0x20, 0x9f, 0x8b, 0xdf,
-            0x4d, 0x1a, 0x9c, 0xd9, 0xe8, 0x61, 0x37, 0xf9, 0x8f, 0x37, 0x00, 0x02, 0x24, 0x64, 0x62, 0x00,
-            0x05, 0x00, 0x00, 0x00, 0x74, 0x65, 0x73, 0x74, 0x00, 0x03, 0x24, 0x72, 0x65, 0x61, 0x64, 0x50,
-            0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6e, 0x63, 0x65, 0x00, 0x17, 0x00, 0x00, 0x00, 0x02, 0x6d,
-            0x6f, 0x64, 0x65, 0x00, 0x08, 0x00, 0x00, 0x00, 0x70, 0x72, 0x69, 0x6d, 0x61, 0x72, 0x79, 0x00,
-            0x00, 0x00, 0x01, 0x75, 0x00, 0x00, 0x00, 0x64, 0x65, 0x6c, 0x65, 0x74, 0x65, 0x73, 0x00, 0x69,
-            0x00, 0x00, 0x00, 0x03, 0x71, 0x00, 0x56, 0x00, 0x00, 0x00, 0x02, 0x24, 0x63, 0x6f, 0x6d, 0x6d,
-            0x65, 0x6e, 0x74, 0x00, 0x43, 0x00, 0x00, 0x00, 0x75, 0x62, 0x65, 0x72, 0x2d, 0x74, 0x72, 0x61,
-            0x63, 0x65, 0x2d, 0x69, 0x64, 0x3a, 0x61, 0x31, 0x36, 0x36, 0x33, 0x35, 0x65, 0x61, 0x38, 0x63,
-            0x39, 0x62, 0x35, 0x33, 0x34, 0x39, 0x3a, 0x36, 0x31, 0x36, 0x66, 0x31, 0x33, 0x37, 0x62, 0x33,
-            0x66, 0x39, 0x35, 0x37, 0x38, 0x36, 0x65, 0x3a, 0x31, 0x37, 0x33, 0x31, 0x36, 0x35, 0x31, 0x32,
-            0x38, 0x34, 0x65, 0x39, 0x38, 0x37, 0x35, 0x66, 0x3a, 0x31, 0x00, 0x00, 0x10, 0x6c, 0x69, 0x6d,
-            0x69, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x7d, 0x00, 0x00, 0x00, 0x02, 0x64, 0x65, 0x6c, 0x65,
+            0x74, 0x65, 0x00, 0x08, 0x00, 0x00, 0x00, 0x6b, 0x69, 0x74, 0x74, 0x65, 0x6e, 0x73,
+            0x00, 0x08, 0x6f, 0x72, 0x64, 0x65, 0x72, 0x65, 0x64, 0x00, 0x01, 0x03, 0x6c, 0x73,
+            0x69, 0x64, 0x00, 0x1e, 0x00, 0x00, 0x00, 0x05, 0x69, 0x64, 0x00, 0x10, 0x00, 0x00,
+            0x00, 0x04, 0x9a, 0xe6, 0x20, 0x9f, 0x8b, 0xdf, 0x4d, 0x1a, 0x9c, 0xd9, 0xe8, 0x61,
+            0x37, 0xf9, 0x8f, 0x37, 0x00, 0x02, 0x24, 0x64, 0x62, 0x00, 0x05, 0x00, 0x00, 0x00,
+            0x74, 0x65, 0x73, 0x74, 0x00, 0x03, 0x24, 0x72, 0x65, 0x61, 0x64, 0x50, 0x72, 0x65,
+            0x66, 0x65, 0x72, 0x65, 0x6e, 0x63, 0x65, 0x00, 0x17, 0x00, 0x00, 0x00, 0x02, 0x6d,
+            0x6f, 0x64, 0x65, 0x00, 0x08, 0x00, 0x00, 0x00, 0x70, 0x72, 0x69, 0x6d, 0x61, 0x72,
+            0x79, 0x00, 0x00, 0x00, 0x01, 0x75, 0x00, 0x00, 0x00, 0x64, 0x65, 0x6c, 0x65, 0x74,
+            0x65, 0x73, 0x00, 0x69, 0x00, 0x00, 0x00, 0x03, 0x71, 0x00, 0x56, 0x00, 0x00, 0x00,
+            0x02, 0x24, 0x63, 0x6f, 0x6d, 0x6d, 0x65, 0x6e, 0x74, 0x00, 0x43, 0x00, 0x00, 0x00,
+            0x75, 0x62, 0x65, 0x72, 0x2d, 0x74, 0x72, 0x61, 0x63, 0x65, 0x2d, 0x69, 0x64, 0x3a,
+            0x61, 0x31, 0x36, 0x36, 0x33, 0x35, 0x65, 0x61, 0x38, 0x63, 0x39, 0x62, 0x35, 0x33,
+            0x34, 0x39, 0x3a, 0x36, 0x31, 0x36, 0x66, 0x31, 0x33, 0x37, 0x62, 0x33, 0x66, 0x39,
+            0x35, 0x37, 0x38, 0x36, 0x65, 0x3a, 0x31, 0x37, 0x33, 0x31, 0x36, 0x35, 0x31, 0x32,
+            0x38, 0x34, 0x65, 0x39, 0x38, 0x37, 0x35, 0x66, 0x3a, 0x31, 0x00, 0x00, 0x10, 0x6c,
+            0x69, 0x6d, 0x69, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
 
-        let msg = MsgOpMsg::from_reader(&mut &buf[..], true, true, buf.len() as u64).await.unwrap();
+        let msg = MsgOpMsg::from_reader(&mut &buf[..], true, true, buf.len() as u64)
+            .await
+            .unwrap();
 
         assert_eq!(0, msg.flag_bits);
         assert_eq!(2, msg.documents.len());
@@ -851,16 +965,17 @@ mod tests {
         assert_eq!(0x69, msg.section_bytes[1].len());
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_checksummed_message() {
         let buf = vec![
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x10, 0x6c, 0x69, 0x73, 0x74, 0x44, 0x61,
-            0x74, 0x61, 0x62, 0x61, 0x73, 0x65, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00, 0x08, 0x6e, 0x61, 0x6d,
-            0x65, 0x4f, 0x6e, 0x6c, 0x79, 0x00, 0x01, 0x03, 0x24, 0x72, 0x65, 0x61, 0x64, 0x50, 0x72, 0x65,
-            0x66, 0x65, 0x72, 0x65, 0x6e, 0x63, 0x65, 0x00, 0x22, 0x00, 0x00, 0x00, 0x02, 0x6d, 0x6f, 0x64,
-            0x65, 0x00, 0x13, 0x00, 0x00, 0x00, 0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x61, 0x72, 0x79, 0x50,
-            0x72, 0x65, 0x66, 0x65, 0x72, 0x72, 0x65, 0x64, 0x00, 0x00, 0x02, 0x24, 0x64, 0x62, 0x00, 0x06,
-            0x00, 0x00, 0x00, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x00, 0x00, 0xf7, 0x20, 0xde, 0xbf,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x65, 0x00, 0x00, 0x00, 0x10, 0x6c, 0x69, 0x73, 0x74,
+            0x44, 0x61, 0x74, 0x61, 0x62, 0x61, 0x73, 0x65, 0x73, 0x00, 0x01, 0x00, 0x00, 0x00,
+            0x08, 0x6e, 0x61, 0x6d, 0x65, 0x4f, 0x6e, 0x6c, 0x79, 0x00, 0x01, 0x03, 0x24, 0x72,
+            0x65, 0x61, 0x64, 0x50, 0x72, 0x65, 0x66, 0x65, 0x72, 0x65, 0x6e, 0x63, 0x65, 0x00,
+            0x22, 0x00, 0x00, 0x00, 0x02, 0x6d, 0x6f, 0x64, 0x65, 0x00, 0x13, 0x00, 0x00, 0x00,
+            0x73, 0x65, 0x63, 0x6f, 0x6e, 0x64, 0x61, 0x72, 0x79, 0x50, 0x72, 0x65, 0x66, 0x65,
+            0x72, 0x72, 0x65, 0x64, 0x00, 0x00, 0x02, 0x24, 0x64, 0x62, 0x00, 0x06, 0x00, 0x00,
+            0x00, 0x61, 0x64, 0x6d, 0x69, 0x6e, 0x00, 0x00, 0xf7, 0x20, 0xde, 0xbf,
         ];
 
         match MsgOpMsg::from_reader(&mut &buf[..], true, true, buf.len() as u64).await {
@@ -868,21 +983,21 @@ mod tests {
                 assert_eq!(1, msg.flag_bits);
                 assert_eq!(1, msg.documents.len());
                 assert_eq!("listDatabases", msg.documents[0].get_str("op").unwrap());
-            },
+            }
             Err(e) => {
                 panic!("Message parsing failed: {}", e);
-            },
+            }
         }
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_query() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(0i32).unwrap();   // flag bits
+        buf.write_i32::<LittleEndian>(0i32).unwrap(); // flag bits
         buf.write(b"tribbles\0").unwrap();
-        buf.write_i32::<LittleEndian>(9i32).unwrap();           // num to skip
-        buf.write_i32::<LittleEndian>(6i32).unwrap();           // num to return
-        let doc = doc! { "a": 1, "q": { "$comment": "ok" } };   // query text
+        buf.write_i32::<LittleEndian>(9i32).unwrap(); // num to skip
+        buf.write_i32::<LittleEndian>(6i32).unwrap(); // num to return
+        let doc = doc! { "a": 1, "q": { "$comment": "ok" } }; // query text
         doc.to_writer(&mut buf).unwrap();
 
         let msg = MsgOpQuery::from_reader(&buf[..], false).await.unwrap();
@@ -894,12 +1009,12 @@ mod tests {
         assert_eq!("ok", msg.query.get_str("comment").unwrap());
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_getmore() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(0).unwrap();      // zero
-        buf.write(b"tribbles\0").unwrap();              // collection name
-        buf.write_i32::<LittleEndian>(10).unwrap();     // number to return
+        buf.write_i32::<LittleEndian>(0).unwrap(); // zero
+        buf.write(b"tribbles\0").unwrap(); // collection name
+        buf.write_i32::<LittleEndian>(10).unwrap(); // number to return
         buf.write_i64::<LittleEndian>(123456).unwrap(); // cursor id
 
         let msg = MsgOpGetMore::from_reader(&buf[..]).await.unwrap();
@@ -908,15 +1023,15 @@ mod tests {
         assert_eq!(123456, msg.cursor_id);
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_update() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(0).unwrap();      // zero
-        buf.write(b"tribbles\0").unwrap();              // collection name
-        buf.write_i32::<LittleEndian>(123).unwrap();    // flags
-        let doc = doc! { "a": 1 };                      // selector
+        buf.write_i32::<LittleEndian>(0).unwrap(); // zero
+        buf.write(b"tribbles\0").unwrap(); // collection name
+        buf.write_i32::<LittleEndian>(123).unwrap(); // flags
+        let doc = doc! { "a": 1 }; // selector
         doc.to_writer(&mut buf).unwrap();
-        let doc = doc! { "b": 2 };                      // update
+        let doc = doc! { "b": 2 }; // update
         doc.to_writer(&mut buf).unwrap();
 
         let msg = MsgOpUpdate::from_reader(&buf[..]).await.unwrap();
@@ -926,13 +1041,13 @@ mod tests {
         assert_eq!("b", msg.update.get_str("op").unwrap());
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_delete() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(0).unwrap();      // zero
-        buf.write(b"tribbles\0").unwrap();              // collection name
-        buf.write_i32::<LittleEndian>(123).unwrap();    // flags
-        let doc = doc! { "a": 1 };                      // selector
+        buf.write_i32::<LittleEndian>(0).unwrap(); // zero
+        buf.write(b"tribbles\0").unwrap(); // collection name
+        buf.write_i32::<LittleEndian>(123).unwrap(); // flags
+        let doc = doc! { "a": 1 }; // selector
         doc.to_writer(&mut buf).unwrap();
 
         let msg = MsgOpDelete::from_reader(&buf[..]).await.unwrap();
@@ -941,24 +1056,24 @@ mod tests {
         assert_eq!("a", msg.selector.get_str("op").unwrap());
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_insert() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(123).unwrap();    // flags
-        buf.write(b"tribbles\0").unwrap();              // collection name
+        buf.write_i32::<LittleEndian>(123).unwrap(); // flags
+        buf.write(b"tribbles\0").unwrap(); // collection name
 
         let msg = MsgOpInsert::from_reader(&buf[..]).await.unwrap();
         assert_eq!(123, msg.flags);
         assert_eq!("tribbles", msg.full_collection_name);
     }
 
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_op_reply() {
         let mut buf = Vec::new();
-        buf.write_i32::<LittleEndian>(123).unwrap();    // flags
+        buf.write_i32::<LittleEndian>(123).unwrap(); // flags
         buf.write_i64::<LittleEndian>(123456).unwrap(); // cursor id
-        buf.write_i32::<LittleEndian>(555).unwrap();    // starting from
-        buf.write_i32::<LittleEndian>(666).unwrap();    // number returned
+        buf.write_i32::<LittleEndian>(555).unwrap(); // starting from
+        buf.write_i32::<LittleEndian>(666).unwrap(); // number returned
 
         for (i, v) in vec!["a", "b", "c"].iter().enumerate() {
             let doc = doc! { v.to_string(): i as i32 };
@@ -974,7 +1089,7 @@ mod tests {
     }
 
     // Test parsing multiple back to back messages
-    #[maybe_async::test(feature="is_sync", async(not(feature="is_sync"), tokio::test))]
+    #[maybe_async::test(feature = "is_sync", async(not(feature = "is_sync"), tokio::test))]
     async fn test_parse_multiple_message() {
         let mut buf = Vec::new();
 
@@ -984,7 +1099,7 @@ mod tests {
 
             let hdr = MsgHeader {
                 message_length: HEADER_LENGTH + msg_buf.len(),
-                request_id: i+1,
+                request_id: i + 1,
                 response_to: i,
                 op_code: 2013,
             };
@@ -1003,11 +1118,14 @@ mod tests {
         for (i, msg) in messages.iter().enumerate() {
             match msg {
                 MongoMessage::Msg(op_msg) => {
-                    assert_eq!(format!("x{}", i), op_msg.documents[0].get_str("op").unwrap());
-                },
+                    assert_eq!(
+                        format!("x{}", i),
+                        op_msg.documents[0].get_str("op").unwrap()
+                    );
+                }
                 _ => {
                     panic!("expecting MsgOpMsg");
-                },
+                }
             }
         }
     }
@@ -1021,5 +1139,4 @@ mod tests {
 
         assert_eq!(want_result, debug_fmt(&buf[..]));
     }
-
 }

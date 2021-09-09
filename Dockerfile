@@ -12,8 +12,9 @@ RUN cargo test --release
 
 FROM debian:buster-slim
 
-RUN apt-get update && apt-get install -y iptables
+RUN apt-get update && apt-get install -y iptables libssl-dev ca-certificates
 RUN update-alternatives --set iptables /usr/sbin/iptables-legacy
+RUN update-ca-certificates
 
 RUN adduser --uid 9999 --disabled-password --gecos '' mongoproxy
 USER mongoproxy
