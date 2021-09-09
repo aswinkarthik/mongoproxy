@@ -24,6 +24,7 @@ const OP_LABELS: &[&str] = &[
     "db",
     "replicaset",
     "server",
+    "service_name",
 ];
 
 lazy_static! {
@@ -467,7 +468,7 @@ impl MongoStatsTracker {
     }
 
     // Label values for common metrics
-    fn label_values<'a>(&'a self, req: &'a ClientRequest) -> [&'a str; 7] {
+    fn label_values<'a>(&'a self, req: &'a ClientRequest) -> [&'a str; 8] {
         [
             &self.client_addr,
             &self.client_application,
@@ -476,6 +477,7 @@ impl MongoStatsTracker {
             &req.db,
             &self.replicaset,
             &self.server_host,
+            &self.app.service_name,
         ]
     }
 
