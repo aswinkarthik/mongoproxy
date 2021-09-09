@@ -123,6 +123,16 @@ async fn main() {
             .value_name("ADMIN_PORT")
             .help(&format!("Port the admin endpoints listens on (metrics and health). Default {}", ADMIN_PORT))
             .takes_value(true))
+        .arg(Arg::with_name("use_tls")
+            .long("use-tls")
+            .help("Use TLS when to upstream TCP connection")
+            .takes_value(false)
+            .required(false))
+        .arg(Arg::with_name("skip_host_verification")
+            .long("skip-host-verification")
+            .help("Skip verification of a TLS host")
+            .takes_value(false)
+            .required(false))
         .get_matches();
 
     let admin_port = matches.value_of("admin_port").unwrap_or(ADMIN_PORT);
@@ -131,6 +141,8 @@ async fn main() {
     let log_mongo_messages = matches.occurrences_of("log_mongo_messages") > 0;
     let enable_jaeger = matches.occurrences_of("enable_jaeger") > 0;
     let jaeger_addr = lookup_address(matches.value_of("jaeger_addr").unwrap_or(JAEGER_ADDR)).unwrap();
+    let use_tls = matches.occurrences_of("use_tls") > 0;
+    let skip_host_verification = matches.occurrences_of("skip_host_verification") > 0;
 
     let (writer, _guard) = tracing_appender::non_blocking(std::io::stdout());
     let subscriber = FmtSubscriber::builder()
@@ -157,6 +169,9 @@ async fn main() {
     let app = AppConfig::new(
         tracer,
         log_mongo_messages,
+        use_tls,
+        skip_host_verification,
+        service_name.to_string(),
     );
 
     MONGOPROXY_RUNTIME_INFO.with_label_values(&[
@@ -257,21 +272,17 @@ async fn run_accept_loop(local_addr: String, remote_addr: String, app: AppConfig
 async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: AppConfig)
     -> Result<(), io::Error>
 {
-    println!("connecting to server: {}", server_addr);
+    let use_tls = app.use_tls;
+    let skip_host_verification = app.skip_host_verification;
+    if use_tls {
+        println!("connecting to server with TLS: {}", server_addr);
+    } else {
+        println!("connecting to server: {}", server_addr);
+    }
+
     let timer = SERVER_CONNECT_TIME_SECONDS.with_label_values(&[server_addr]).start_timer();
     let server_addr = lookup_address(server_addr)?;
-    let connector = NativeTlsConnector::builder()
-                            .danger_accept_invalid_hostnames(true)
-                            .min_protocol_version(Some(Protocol::Tlsv12))
-                            .build().unwrap();
-    let tcp_server_stream = TcpStream::connect(&server_addr).await?;
-    tcp_server_stream.set_nodelay(true)?;
-    
-    let result = TlsConnector::from(connector).connect(&server_addr.to_string(), tcp_server_stream).await;
-    let mut server_stream = match result {
-        Ok(stream) => stream,
-        Err(err) => panic!("{}", err),
-    };
+    let server_stream = TcpStream::connect(&server_addr).await?;
     timer.observe_duration();
 
     let client_addr = format_client_address(&client_stream.peer_addr()?);
@@ -279,6 +290,7 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let log_mongo_messages = app.log_mongo_messages;
     let tracing_enabled = app.tracer.is_some();
 
+    server_stream.set_nodelay(true)?;
     client_stream.set_nodelay(true)?;
 
     // Start the tracker to parse and track MongoDb messages from the input stream. This works by
@@ -288,6 +300,8 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
     let (client_tx, client_rx): (mpsc::Sender<BufBytes>, mpsc::Receiver<BufBytes>) = mpsc::channel(MAX_CHANNEL_EVENTS);
     let (server_tx, server_rx): (mpsc::Sender<BufBytes>, mpsc::Receiver<BufBytes>) = mpsc::channel(MAX_CHANNEL_EVENTS);
 
+    let signal_client = client_tx.clone();
+    let signal_server = server_tx.clone();
 
     let tracker = MongoStatsTracker::new(
         &client_addr,
@@ -303,21 +317,54 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
 
     let (mut read_client, mut write_client) = client_stream.into_split();
 
-    let task = async {
-        proxy_bytes(
-            &mut read_client,
-            &mut write_client,
-            &mut server_stream,
-            client_tx,
-            server_tx,
-        ).await?;
-        Ok::<(), io::Error>(())
-    }.instrument(info_span!("Sequential proxy"));
+    if use_tls {
+        let connector = NativeTlsConnector::builder()
+            .danger_accept_invalid_hostnames(skip_host_verification)
+            .min_protocol_version(Some(Protocol::Tlsv12))
+            .build()
+            .unwrap();
+        let result = TlsConnector::from(connector)
+            .connect(&server_addr.to_string(), server_stream)
+            .await;
+        let mut tls_server_stream = match result {
+            Ok(stream) => stream,
+            Err(err) => panic!("{}", err),
+        };
 
-    match tokio::try_join!(task) {
-        Ok(_) => Ok(()),
-        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
-        Err(e) => Err(e),
+        let task = async {
+            proxy_bytes_tls(
+                &mut read_client,
+                &mut write_client,
+                &mut tls_server_stream,
+                client_tx,
+                server_tx,
+            ).await?;
+            Ok::<(), io::Error>(())
+        }.instrument(info_span!("Sequential proxy"));
+
+        match tokio::try_join!(task) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+            Err(e) => Err(e),
+        }
+    } else {
+        let (mut read_server, mut write_server) = server_stream.into_split();
+
+        let client_task = async {
+            proxy_bytes(&mut read_client, &mut write_server, client_tx, signal_server).await?;
+            Ok::<(), io::Error>(())
+        }.instrument(info_span!("client proxy"));
+
+        let server_task = async {
+            proxy_bytes(&mut read_server, &mut write_client, server_tx, signal_client).await?;
+            Ok::<(), io::Error>(())
+        }.instrument(info_span!("server proxy"));
+
+        match tokio::try_join!(client_task, server_task) {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -325,6 +372,43 @@ async fn handle_connection(server_addr: &str, client_stream: TcpStream, app: App
 // for processing. Another channel is used to notify the other tracker of
 // failures.
 async fn proxy_bytes(
+    read_from: &mut OwnedReadHalf,
+    write_to: &mut OwnedWriteHalf,
+    tracker_channel: mpsc::Sender<BufBytes>,
+    notify_channel: mpsc::Sender<BufBytes>,
+) -> Result<(), io::Error>
+{
+    let mut tracker_ok = true;
+
+    loop {
+        let mut buf = bytes::BytesMut::with_capacity(READ_BUFFER_SIZE);
+        let len = read_from.read_buf(&mut buf).await?;
+
+        if len > 0 {
+            write_to.write_all(&buf[0..len]).await?;
+
+            if tracker_ok {
+                if let Err(e) = tracker_channel.try_send(Ok(buf)) {
+                    error!("error sending to tracker, stop: {}", e);
+                    TRACKER_CHANNEL_ERRORS_TOTAL.inc();
+                    tracker_ok = false;
+
+                    // Let the other side know that we're closed.
+                    let notification = io::Error::new(io::ErrorKind::UnexpectedEof, "notify channel close");
+                    let _ = notify_channel.send(Err(notification)).await;
+                }
+            }
+        } else {
+            // EOF on read, return Err to signal try_join! to return
+            return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
+        }
+    }
+}
+
+// Copy bytes from server to client and vice versa.
+// TlsStream does not support splitting the server channel into receive and send.
+// Hence, this is done sequentially. Copy bytes from client to server and server to client.
+async fn proxy_bytes_tls(
     client_read_from: &mut OwnedReadHalf,
     client_write_to: &mut OwnedWriteHalf,
     server: &mut TlsStream<TcpStream>,
